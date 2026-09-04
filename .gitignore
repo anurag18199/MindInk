@@ -11,6 +11,7 @@ diag/
 processed/
 output/
 outputs/
+step10/
 
 # ---- Raw data (huge; never commit) ----
 datasets-NR/
@@ -35,5 +36,19 @@ Thumbs.db
 .vscode/
 .idea/
 
-
+check_iclabel_provenance.py
+check_raw_bw.py
+check_step5B.py
+check_step6_results.py
+check_step7.py
+config.py
+features.py
+run_pipeline.py
+step5A_timing_inspect.py
+step5B_segment.py
+step6_probe.py
+step6_test.py
+step6_eyetest.py
+step8b_gate_quality.py
+step9b_test.py
 
