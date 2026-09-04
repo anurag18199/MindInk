@@ -1,0 +1,39 @@
+# ---- MindInk intermediate outputs (never commit) ----
+processed_raw/
+ica/
+segments/
+features/
+baselines/
+metrics/
+gates/
+runs/
+diag/
+processed/
+output/
+outputs/
+
+# ---- Raw data (huge; never commit) ----
+datasets-NR/
+dataset-NR/
+*.mat
+*.fif
+*.npy
+*.npz
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.ipynb_checkpoints/
+
+# ---- OS / editor ----
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+
+
