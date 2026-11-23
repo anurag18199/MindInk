@@ -22,6 +22,33 @@ KEY DIFFERENCES vs the preprocessed-route Step 3:
 MNE is required for the filtering/montage/resample. The channel-selection,
 concatenation, and index-remapping logic is pure numpy and is unit-tested in
 __main__ against a real block WITHOUT needing MNE.
+
+RAW EEG + ET files
+       ↓
+   Step 2 loader
+       ↓
+ RawBlock objects
+       ↓
+ Remove unwanted channels
+       ↓
+ Concatenate NR1 + NR2 + NR3
+       ↓
+ One continuous EEG
+       ↓
+ ┌─────────────────────┐
+ │                     │
+ ↓                     ↓
+Analysis branch       ICA branch
+0.5–100 Hz            1–100 Hz
+50 Hz notch           50 Hz notch
+Avg reference         Avg reference
+250 Hz                250 Hz
+ │                     │
+ └──────────┬──────────┘
+            ↓
+     Remap annotations
+            ↓
+          Save
 """
 
 from __future__ import annotations
@@ -129,12 +156,12 @@ def remap_indices_after_resample(sentences, blink_intervals, factor):
 def build_mne_raw(data, ch_names, ch_pos, sfreq):
     import mne
     info = mne.create_info(ch_names, sfreq=sfreq, ch_types="eeg")
-    raw = mne.io.RawArray(data, info, verbose="error")
+    raw = mne.io.RawArray(data, info, verbose="error")      #Converts the NumPy EEG matrix into an MNE Raw object
     # Montage straight from the file's real electrode coordinates.
     pos = {n: ch_pos[i] / 1000.0 if np.isfinite(ch_pos[i]).all() else [0, 0, 0]
            for i, n in enumerate(ch_names)}  # EEGLAB XYZ are in ~mm; MNE wants m
-    montage = mne.channels.make_dig_montage(ch_pos=pos, coord_frame="head")
-    raw.set_montage(montage, on_missing="warn", verbose="error")
+    montage = mne.channels.make_dig_montage(ch_pos=pos, coord_frame="head") #creates the electrode montage.
+    raw.set_montage(montage, on_missing="warn", verbose="error")    #attaches electrode positions to the MNE Raw object.
     return raw
 
 
@@ -147,7 +174,7 @@ def filter_branch(raw, hp, lp, notch, out_sfreq, recover_cz=False):
     # 105 exactly: add it flat, then average-referencing populates it as -sum(others).
     if recover_cz and "Cz" not in r.ch_names:
         r = mne.add_reference_channels(r, "Cz", verbose="error")
-    r.set_eeg_reference("average", projection=False, verbose="error")
+    r.set_eeg_reference("average", projection=False, verbose="error")       #This makes the data average-referenced.
     if r.info["sfreq"] != out_sfreq:
         r.resample(out_sfreq, npad="auto", verbose="error")
     return r
@@ -208,28 +235,117 @@ def preprocess_subject_raw(blocks, output_dir, subject):
 # ---------------------------------------------------------------------------
 # CLI: load blocks then preprocess
 # ---------------------------------------------------------------------------
+def find_block_files(raw_dir, subject, block):
+    """Locate the EEG and ET .mat files for one subject+block.
+
+    Looks in raw_dir/, then raw_dir/<subject>/, then falls back to a recursive
+    search by filename pattern.
+    Input : raw_dir (str/Path), subject (e.g. 'YAG'), block (e.g. 'NR1').
+    Output: (eeg_path, et_path) as Paths, or (None, None) if not found.
+    """
+    raw_dir = Path(raw_dir)
+    # Most likely locations: flat in raw_dir, or inside a per-subject folder.
+    for base in (raw_dir, raw_dir / subject):
+        eeg = base / f"{subject}_{block}_EEG.mat"
+        et  = base / f"{subject}_{block}_ET.mat"
+        if eeg.exists() and et.exists():
+            return eeg, et
+    # Fallback: search anywhere under raw_dir (handles unexpected prefixes/nesting).
+    eeg_hits = list(raw_dir.rglob(f"*{subject}_{block}_EEG.mat"))
+    et_hits  = list(raw_dir.rglob(f"*{subject}_{block}_ET.mat"))
+    if eeg_hits and et_hits:
+        return eeg_hits[0], et_hits[0]
+    return None, None
+
+
+
+def process_one_subject(raw_dir, subject, block_names, output_dir):
+    """Load, preprocess, and export one subject end-to-end.
+
+    Input : raw_dir (root), subject (e.g. 'YAG'), block_names (e.g. ['NR1'..'NR7']),
+            output_dir (where results go).
+    Output: path to the exported zuco_step3_<subject>.npz, or None if no blocks
+            could be loaded for this subject (so the batch loop can skip it).
+    """
+    blocks = []
+    for blk in block_names:
+        eeg, et = find_block_files(raw_dir, subject, blk)   # robust lookup from before
+        if eeg is None:
+            print(f"  [{subject}] skip {blk}: file not found")
+            continue
+        print(f"  [{subject}] found {blk}: {eeg}")
+        blocks.append(load_raw_block(eeg, et, subject, blk))
+
+    if not blocks:
+        print(f"  [{subject}] no blocks loaded — skipping")
+        return None
+
+    # Heavy lifting (filter both branches, remap indices, save fif/json).
+    analysis, ica, sentences_rs, blinks_rs = preprocess_subject_raw(
+        blocks, output_dir, subject)
+
+    # Export the analysis EEG as the .npz the baseline denoisers consume.
+    eeg_data = analysis.get_data().astype("float32")        # (n_channels, n_times)
+    out_npz = Path(output_dir) / subject / f"zuco_step3_{subject}.npz"
+    np.savez(out_npz,
+             eeg=eeg_data,
+             sfreq=np.float32(OUTPUT_SFREQ),
+             ch_names=np.array(analysis.ch_names))
+    print(f"  [{subject}] exported baseline input -> {out_npz}")
+    return out_npz
+
+
+def discover_subjects(raw_dir, pattern="Y*"):
+    """Find subject folders under raw_dir matching `pattern`.
+
+    Input : raw_dir (root), glob pattern for subject folders.
+    Output: sorted list of subject names (folder names only, directories only),
+            e.g. ['YAC', 'YAG', 'YAK', ...].
+    """
+    return sorted(p.name for p in Path(raw_dir).glob(pattern) if p.is_dir() and any(p.glob("*_EEG.mat")))
+
+
 def main():
     import argparse
     ap = argparse.ArgumentParser(description="Step 3 (RAW route) preprocessing")
-    ap.add_argument("--subject", default="YAG")
+    # --subject runs one; --all-subjects runs every YA* folder found under --raw-dir.
+    ap.add_argument("--subject", default=None,
+                    help="single subject (e.g. YAG). Ignored if --all-subjects is set.")
+    ap.add_argument("--all-subjects", action="store_true",
+                    help="process every YA* folder under --raw-dir")
     ap.add_argument("--raw-dir", required=True,
-                    help="folder with YAG_NR*_EEG.mat and _ET.mat")
-    ap.add_argument("--blocks", nargs="+", default=["NR1", "NR2", "NR3"])
+                    help="root folder containing per-subject folders (YAG/, YAC/, ...)")
+    ap.add_argument("--blocks", nargs="+",
+                    default=["NR1", "NR2", "NR3", "NR4", "NR5", "NR6", "NR7"])
     ap.add_argument("--output", default="processed_raw")
+    ap.add_argument("--subject-glob", default="Y*", help="glob pattern for subject folders (default YA*)")
     a = ap.parse_args()
 
-    blocks = []
-    for blk in a.blocks:
-        eeg = Path(a.raw_dir) / f"{a.subject}_{blk}_EEG.mat"
-        et = Path(a.raw_dir) / f"{a.subject}_{blk}_ET.mat"
-        if not eeg.exists() or not et.exists():
-            print(f"  skip {blk}: missing {eeg.name} or {et.name}")
-            continue
-        blocks.append(load_raw_block(eeg, et, a.subject, blk))
-    if not blocks:
-        raise SystemExit("No blocks loaded.")
-    preprocess_subject_raw(blocks, a.output, a.subject)
+    # Decide which subjects to run.
+    if a.all_subjects:
+        subjects = discover_subjects(a.raw_dir, a.subject_glob)
+        if not subjects:
+            raise SystemExit(f"No YA* subject folders found under {a.raw_dir}")
+        print(f"[batch] found {len(subjects)} subjects: {subjects}")
+    elif a.subject:
+        subjects = [a.subject]
+    else:
+        raise SystemExit("Pass either --subject YAG or --all-subjects")
 
+    # Process each; collect successes/failures so a bad subject doesn't stop the batch.
+    done, failed = [], []
+    for subj in subjects:
+        print(f"\n===== {subj} =====")
+        try:
+            out = process_one_subject(a.raw_dir, subj, a.blocks, a.output)
+            (done if out else failed).append(subj)
+        except Exception as e:
+            print(f"  [{subj}] ERROR: {e}")
+            failed.append(subj)
+
+    print(f"\n[batch] done: {done}")
+    if failed:
+        print(f"[batch] failed/empty: {failed}")
 
 if __name__ == "__main__":
     main()
